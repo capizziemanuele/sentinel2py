@@ -1,0 +1,12 @@
+name: sentinel2py
+channels:
+  - conda-forge
+dependencies:
+  - python=3.11
+  - rasterio
+  - matplotlib
+  - tqdm
+  - pystac-client
+  - planetary-computer
+  - requests
+  - numpy
