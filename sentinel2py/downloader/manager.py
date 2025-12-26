@@ -1,24 +1,39 @@
 # sentinel2py/downloader/manager.py
-
 import os
 from typing import Optional, List, Dict
 import planetary_computer
-from tqdm.auto import tqdm
+from pystac_client import Client
+from tqdm import tqdm
 
 from sentinel2py.downloader.config import BAND_PRESETS, BAND_RESOLUTIONS
 from sentinel2py.downloader.fetch import BandFetcher
 from sentinel2py.downloader.stacker import BandStacker
 from sentinel2py.downloader.selector import SentinelSelector
 
-
 class Sentinel2Manager:
-    """Manage search, download, stacking, and selection of Sentinel-2 tiles using presets."""
+    """Manage search, download, stacking, and selection of Sentinel-2 tiles."""
 
-    def __init__(self, out_dir: str = "./data"):
+    def __init__(self, out_dir="./data"):
         self.out_dir = out_dir
         self.fetcher = BandFetcher()
         self.stacker = BandStacker()
         self.selector = SentinelSelector()
+        self.catalog_url = "https://planetarycomputer.microsoft.com/api/stac/v1"
+
+    # -----------------------------
+    # Search
+    # -----------------------------
+    def find_items(self, bbox, start, end, max_cloud=20, limit=10) -> List:
+        catalog = Client.open(self.catalog_url)
+        search = catalog.search(
+            collections=["sentinel-2-l2a"],
+            bbox=bbox,
+            datetime=f"{start}/{end}",
+            query={"eo:cloud_cover": {"lt": max_cloud}},
+            limit=limit,
+        )
+        items = list(search.get_items())
+        return [planetary_computer.sign(item) for item in items]
 
     # -----------------------------
     # Selection
@@ -49,42 +64,15 @@ class Sentinel2Manager:
     # Download & stack
     # -----------------------------
     def download_bands(
-    self,
-    item,
-    preset: str = "RGB",
-    stack: bool = True,
-    overwrite: bool = False,
-    target_res: Optional[float | str] = None,  # None=native, "highest"=highest resolution, number=custom
-    verbose: bool = True
-):
-        """
-        Download bands using a preset and optionally stack them.
-
-        Parameters
-        ----------
-        item : pystac.Item
-            STAC item to download.
-        preset : str
-            Preset from config.py (e.g., "RGB", "NIR").
-        stack : bool
-            Whether to stack the bands after downloading.
-        overwrite : bool
-            Overwrite existing files.
-        target_res : float | str | None
-            Stacking resolution:
-                None -> native resolution
-                "highest" -> stack at highest (smallest) resolution among bands
-                number -> stack at custom resolution (in meters)
-        verbose : bool
-            Print progress messages.
-
-        Returns
-        -------
-        downloaded : dict
-            {band: {"path": path, "resolution": res}}
-        stacked : dict or None
-            {resolution: stacked_file} if stacked, else None
-        """
+        self,
+        item,
+        preset: str = "RGB",
+        stack: bool = True,
+        overwrite: bool = False,
+        target_res: Optional[float] = None,
+        verbose: bool = True
+    ):
+        """Download bands and optionally stack them."""
         if preset not in BAND_PRESETS:
             raise ValueError(f"Preset '{preset}' not found. Available: {list(BAND_PRESETS.keys())}")
 
@@ -93,56 +81,122 @@ class Sentinel2Manager:
         tile_dir = os.path.join(self.out_dir, tile_id)
         os.makedirs(tile_dir, exist_ok=True)
 
-        # -----------------------------
-        # Download bands
-        # -----------------------------
-        downloaded = {}
+        downloaded_paths = {}
+
+        if verbose:
+            print(f"[INFO] Downloading {len(bands)} Sentinel-2 bands...")
+
+        # Download bands with progress
         for band in tqdm(bands, desc="Overall Bands", unit="band", leave=True, dynamic_ncols=True):
             path = self.fetcher.download_one(item, band, tile_dir, overwrite, verbose)
             res = BAND_RESOLUTIONS.get(band, 10)
-            downloaded[band] = {"path": path, "resolution": res}
+            downloaded_paths[band] = {"path": path, "resolution": res}
 
         if not stack:
             if verbose:
                 print("[INFO] Stacking skipped")
-            return downloaded, None
+            return downloaded_paths, None
 
-        # -----------------------------
-        # Decide stacking function
-        # -----------------------------
-        if target_res is None:
-            stack_func = self.stacker.stack_same_resolution
-            res_label = min([downloaded[b]["resolution"] for b in bands])
-            if verbose:
-                print("[INFO] Stacking at native resolution")
-        elif target_res == "highest":
+        # Decide stacking resolution
+        if target_res == "highest":
             stack_func = self.stacker.stack_to_highest_resolution
-            res_label = min([downloaded[b]["resolution"] for b in bands])
             if verbose:
-                print("[INFO] Stacking at highest resolution among bands")
+                print(f"[INFO] Stacking bands to highest resolution among bands")
         elif isinstance(target_res, (int, float)):
             stack_func = lambda paths, out_file: self.stacker.stack_to_resolution(paths, out_file, target_res)
-            res_label = target_res
             if verbose:
-                print(f"[INFO] Stacking at custom resolution: {target_res}m")
+                print(f"[INFO] Stacking bands to custom resolution: {target_res}m")
         else:
-            raise ValueError("target_res must be None, 'highest', or a number")
+            stack_func = self.stacker.stack_same_resolution
+            if verbose:
+                print(f"[INFO] Stacking bands at native resolution")
 
-        # -----------------------------
-        # Build output stacked filename
-        # -----------------------------
         date_str = str(item.properties.get("datetime", "unknown")).split("T")[0].replace("-", "")
         band_token = "_".join(bands)
-        stacked_file = os.path.join(tile_dir, f"{band_token}_{date_str}_{res_label}m_stack.tif")
+        if target_res == "highest":
+            res_label = min([downloaded_paths[b]["resolution"] for b in bands])
+        elif isinstance(target_res, (int, float)):
+            res_label = target_res
+        else:
+            res_label = min([downloaded_paths[b]["resolution"] for b in bands])
 
-        # Skip if exists
+        stacked_file = os.path.join(tile_dir, f"{band_token}_{date_str}_{res_label}m_stack.tif")
         if os.path.exists(stacked_file) and not overwrite:
             if verbose:
                 print(f"[SKIP] Stacked file already exists: {stacked_file}")
-            return downloaded, {res_label: stacked_file}
+            return downloaded_paths, {res_label: stacked_file}
 
-        # Perform stacking
-        band_paths = [downloaded[b]["path"] for b in bands]
+        band_paths = [downloaded_paths[b]["path"] for b in bands]
         stacked_path = stack_func(band_paths, stacked_file)
 
-        return downloaded, {res_label: stacked_path}
+        return downloaded_paths, {res_label: stacked_path}
+
+    # -----------------------------
+    # Multiple tiles downloader
+    # -----------------------------
+    def download_multiple_tiles(
+        self,
+        tiles: list,
+        preset: str = "RGB",
+        stack: bool = True,
+        target_res: float | str | None = None,
+        overwrite: bool = False
+    ):
+        all_downloaded = {}
+        all_stacked = {}
+
+        for i, tile in enumerate(tiles):
+            tile_id = tile.properties.get("sentinel:tile_id", tile.id)
+            cloud_cover = tile.properties.get("eo:cloud_cover", "N/A")
+            print(f"\n[{i+1}/{len(tiles)}] Downloading tile {tile_id} | cloud: {cloud_cover}%")
+
+            downloaded, stacked = self.download_bands(
+                tile,
+                preset=preset,
+                stack=stack,
+                overwrite=overwrite,
+                target_res=target_res,
+                verbose=True
+            )
+
+            all_downloaded[tile_id] = downloaded
+            all_stacked[tile_id] = stacked
+
+        return all_downloaded, all_stacked
+
+    # -----------------------------
+    # Get least cloudy N tiles
+    # -----------------------------
+    def get_least_cloudy_tiles(self, bbox, start_date, end_date, max_cloud=20, limit=50, n_tiles=3):
+        items = self.find_items(bbox, start_date, end_date, max_cloud=max_cloud, limit=limit)
+        if not items:
+            raise ValueError("No Sentinel-2 tiles found.")
+        sorted_items = sorted(items, key=lambda i: i.properties.get("eo:cloud_cover", 100))
+        return sorted_items[:n_tiles]
+
+    # -----------------------------
+    # Pretty print STAC items
+    # -----------------------------
+    def print_tiles(self, tiles: list):
+        """
+        Nicely print a list of STAC items (tiles).
+
+        Parameters
+        ----------
+        tiles : list
+            List of STAC items
+        """
+        if not tiles:
+            print("[INFO] No tiles to display.")
+            return
+
+        print(f"\n{'Index':<5} | {'Tile ID':<15} | {'Date':<12} | {'Cloud %':<8}")
+        print("-" * 50)
+        for i, tile in enumerate(tiles):
+            tile_id = tile.properties.get("sentinel:tile_id", tile.id)
+            date = tile.properties.get("datetime", "unknown").split("T")[0]
+            cloud = tile.properties.get("eo:cloud_cover", "N/A")
+            print(f"{i:<5} | {tile_id:<15} | {date:<12} | {cloud:<8}")
+        print("-" * 50)
+
+
