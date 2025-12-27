@@ -2,6 +2,7 @@
 
 import os
 import time
+import re
 import requests
 from typing import List, Dict, Any
 import planetary_computer
@@ -26,9 +27,18 @@ class BandFetcher:
     # Filename builder
     # -------------------------
     def _build_band_filename(self, band: str, item) -> str:
+        """
+        Build filename for a band including date, tile ID, and resolution.
+        Example: B04_20250607_T32PKC_10m.tif
+        """
         date_str = item.properties.get("datetime", "unknown").split("T")[0].replace("-", "")
+        
+        # Extract tile ID from item.id using regex
+        match = re.search(r'T\d+[A-Z]{3}', item.id)
+        tile_id = match.group(0) if match else "unknown_tile"
+        
         res = BAND_RESOLUTIONS.get(band, 10)
-        return f"{band}_{date_str}_{res}m.tif"
+        return f"{band}_{date_str}_{tile_id}_{res}m.tif"
 
     # -------------------------
     # Download a single band

@@ -1,95 +1,120 @@
 # sentinel2py/downloader/stacker.py
 
+"""
+BandStacker – clean stacking utilities for Sentinel-2 bands.
+
+Features:
+- Stack multiple TIFF bands into a single raster
+- Auto-resample to highest resolution or custom resolution
+- Includes a beautiful tqdm progress bar
+"""
+
 import os
-from typing import List, Optional
-import numpy as np
 import rasterio
-from rasterio.warp import reproject, Resampling
+from rasterio.enums import Resampling
 from tqdm.auto import tqdm
 
+
 class BandStacker:
-    """Stack Sentinel-2 bands with flexible resampling and proper QGIS-friendly output."""
+    """Stacks multiple raster bands into a single multi-band GeoTIFF."""
 
-    @staticmethod
-    def _stack_arrays(band_paths: List[str], out_path: str, target_res: Optional[float] = None):
-        if not band_paths:
-            raise ValueError("No band paths provided for stacking.")
+    # ===========================
+    # Utility
+    # ===========================
+    def _get_base_meta(self, band_paths):
+        """Return metadata from the first band."""
+        with rasterio.open(band_paths[0]) as src:
+            return src.meta.copy(), src.height, src.width, src.res
 
-        # Open reference band
-        with rasterio.open(band_paths[0]) as ref:
-            meta = ref.meta.copy()
-            ref_crs = ref.crs
-            ref_dtype = ref.meta["dtype"]
+    # ===========================
+    # CORE STACKER
+    # ===========================
+    def _stack_write(self, out_file, meta, band_paths, read_fn):
+        """Write stacked output using a readable callback."""
+        os.makedirs(os.path.dirname(out_file), exist_ok=True)
 
-            if target_res:
-                # Compute new width/height based on target resolution
-                scale_x = ref.res[0] / target_res
-                scale_y = ref.res[1] / target_res
-                width = int(ref.width * scale_x)
-                height = int(ref.height * scale_y)
+        with rasterio.open(out_file, "w", **meta) as dst:
+            for i, band in enumerate(
+                tqdm(range(len(band_paths)), desc="📦 Writing stack", unit="band")
+            ):
+                data = read_fn(i, band_paths[i])
+                dst.write(data, i + 1)
 
-                # Build new transform
-                transform = rasterio.Affine(
-                    target_res, ref.transform.b, ref.transform.c,
-                    ref.transform.d, -target_res, ref.transform.f
-                )
-                print(f"[STACK] Resampling bands to {target_res}m resolution")
-            else:
-                width = ref.width
-                height = ref.height
-                transform = ref.transform
-                target_res = ref.res[0]
-                print(f"[STACK] Keeping original resolution: {target_res}m")
+        return out_file
 
-        # Initialize empty stack array
-        stack = np.zeros((len(band_paths), height, width), dtype=ref_dtype)
+    # ===========================
+    # MODES
+    # ===========================
+    def stack_same_resolution(self, band_paths, out_file):
+        """Stack assuming all bands have same pixel resolution."""
+        meta, _, _, _ = self._get_base_meta(band_paths)
+        meta.update(count=len(band_paths))
 
-        # Reproject each band into the stack with progress bar
-        for i, path in enumerate(tqdm(band_paths, desc="Stacking bands", unit="band")):
+        # Reader callback
+        def reader(i, path):
             with rasterio.open(path) as src:
-                reproject(
-                    source=rasterio.band(src, 1),
-                    destination=stack[i],
-                    src_transform=src.transform,
-                    src_crs=src.crs,
-                    dst_transform=transform,
-                    dst_crs=ref_crs,
-                    resampling=Resampling.bilinear
+                return src.read(1)
+
+        return self._stack_write(out_file, meta, band_paths, reader)
+
+    def stack_to_highest_resolution(self, band_paths, out_file):
+        """Resample all bands to highest resolution (minimum pixel size)."""
+        # choose smallest resolution band
+        band_res_info = []
+        for p in band_paths:
+            with rasterio.open(p) as src:
+                band_res_info.append((p, src.res[0]))
+        base_band = sorted(band_res_info, key=lambda x: x[1])[0][0]
+
+        with rasterio.open(base_band) as base:
+            base_meta = base.meta.copy()
+            meta = base_meta.copy()
+            meta.update(count=len(band_paths))
+            dst_height, dst_width = base.height, base.width
+
+        def reader(i, path):
+            with rasterio.open(path) as src:
+                data = src.read(
+                    out_shape=(1, dst_height, dst_width),
+                    resampling=Resampling.bilinear,
                 )
+                return data[0]
 
-        # Update metadata for the stacked file
-        meta.update(
-            count=len(band_paths),
-            height=height,
-            width=width,
-            transform=transform,
-            dtype=ref_dtype
-        )
+        return self._stack_write(out_file, meta, band_paths, reader)
 
-        # Write stacked raster
-        with rasterio.open(out_path, "w", **meta) as dst:
-            for i in range(len(band_paths)):
-                dst.write(stack[i], i + 1)
+    def stack_to_resolution(self, band_paths, out_file, resolution):
+        """Resample all bands to a custom target resolution (e.g. 10, 20)."""
+        # find first band at that resolution
+        base_path = None
+        for p in band_paths:
+            with rasterio.open(p) as src:
+                if abs(src.res[0] - float(resolution)) < 1e-6:
+                    base_path = p
+                    break
 
-        print(f"[STACK] Stacked file created: {out_path}")
-        return out_path
+        if base_path is None:
+            base_path = band_paths[0]
 
-    # -----------------------------
-    # Public stacking methods
-    # -----------------------------
-    def stack_same_resolution(self, band_paths: List[str], out_path: str):
-        """Stack bands at their native resolution."""
-        print(f"[INFO] Stacking {len(band_paths)} bands at original resolution...")
-        return self._stack_arrays(band_paths, out_path)
+        with rasterio.open(base_path) as base:
+            base_meta = base.meta.copy()
+            res_scale = base.res[0] / float(resolution)
+            meta = base_meta.copy()
+            meta.update(
+                count=len(band_paths),
+                height=int(base.height * res_scale),
+                width=int(base.width * res_scale),
+                transform=base.transform * base.transform.scale(
+                    base.res[0] / resolution, base.res[1] / resolution
+                ),
+            )
+            dst_height, dst_width = meta["height"], meta["width"]
 
-    def stack_to_highest_resolution(self, band_paths: List[str], out_path: str):
-        """Stack bands to the highest (smallest) resolution among the bands."""
-        resolutions = [rasterio.open(p).res[0] for p in band_paths]
-        target_res = min(resolutions)
-        print(f"[INFO] Stacking {len(band_paths)} bands to highest resolution ({target_res}m)...")
-        return self._stack_arrays(band_paths, out_path, target_res)
+        def reader(i, path):
+            with rasterio.open(path) as src:
+                data = src.read(
+                    out_shape=(1, dst_height, dst_width),
+                    resampling=Resampling.bilinear,
+                )
+                return data[0]
 
-    def stack_to_resolution(self, band_paths: List[str], out_path: str, resolution: float):
-        """Stack bands to a user-defined resolution."""
-        print(f"[INFO] Stacking {len(band_paths)} bands to target resolution ({resolution}m)...")
-        return self._stack_arrays(band_paths, out_path, resolution)
+        return self._stack_write(out_file, meta, band_paths, reader)

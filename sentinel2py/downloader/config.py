@@ -1,10 +1,11 @@
 # sentinel2py/downloader/config.py
 
 BAND_PRESETS = {
-    "RGB": ["B04", "B03", "B02"],
+    "RGB": ["B02", "B03", "B04"],
+    "RGBNIR": ["B02","B03", "B04", "B08"],
     "VISUAL": ["visual"],
     "NIR": ["B08"],
-    "NDVI": ["B08", "B04"],
+    "NDVI": ["B04", "B08"],
     "NDWI": ["B03", "B08"],
     "SWIR": ["B11", "B12"],
     "RE_ALL": ["B05", "B06", "B07", "B8A"],
