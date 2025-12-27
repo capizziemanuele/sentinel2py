@@ -17,7 +17,7 @@
 ## Installation
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/capizziemanuele/sentinel2py.git
 cd sentinel2py
 pip install -r requirements.txt
 ```
