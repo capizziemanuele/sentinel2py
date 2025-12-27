@@ -117,11 +117,4 @@ print(df)
 
 - NDVI and NDWI values can remain in the natural range `[-1,1]` or be normalized to `[0,1]`
 - `BAND_PRESETS` are customizable; you can define new combinations of bands
-- Downsampling (`downsample`) is useful for plotting large tiles without using too much memory
-
----
-
-## License
-
-MIT License – free to use and modify
-
+- Downsampling (`downsample`) is useful for plotting large tiles without using too much memory.
